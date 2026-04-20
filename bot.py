@@ -24,203 +24,224 @@ log = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
-def _price(text: str) -> int:
-    d = re.sub(r"[^\d]", "", str(text or ""))
+LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+
+def _price(v) -> int:
+    d = re.sub(r"[^\d]", "", str(v or ""))
     return int(d) if d else 0
 
-def _browser_args():
-    return ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-            "--disable-blink-features=AutomationControlled"]
+def _open_page(pw, url: str, wait_ms=4000):
+    br = pw.chromium.launch(headless=True, args=LAUNCH_ARGS)
+    ctx = br.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        locale="ru-RU",
+    )
+    page = ctx.new_page()
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(wait_ms)
+    return br, page
 
 # ════════════════════════════════════════════════════════════
-#  UZUM — перехватываем API-ответы которые сайт сам запрашивает
+#  UZUM — вызываем их API изнутри браузера (с их куками)
 # ════════════════════════════════════════════════════════════
 def parse_uzum(min_discount=30, limit=10) -> list[dict]:
-    captured = []
-
-    def on_response(resp):
-        try:
-            if "api.uzum.uz" in resp.url and resp.status == 200:
-                if any(k in resp.url for k in ["search", "product", "promotion", "campaign"]):
-                    data = resp.json()
-                    captured.append(data)
-        except Exception:
-            pass
-
+    deals = []
     try:
         with sync_playwright() as pw:
-            br = pw.chromium.launch(headless=True, args=_browser_args())
-            ctx = br.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-                locale="ru-RU",
-            )
-            page = ctx.new_page()
-            page.on("response", on_response)
-            page.goto("https://uzum.uz/ru/promotions", wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(3000)
-            br.close()
-    except Exception as e:
-        log.warning(f"[Uzum] Browser error: {e}")
+            br, page = _open_page(pw, "https://uzum.uz/ru/promotions", wait_ms=5000)
 
-    # Ищем товары во всех перехваченных ответах
-    deals = []
-    seen_ids = set()
-    for data in captured:
-        raw_text = json.dumps(data)
-        # Рекурсивно ищем массивы с товарами
-        products = (data.get("payload", {}).get("products", [])
-                    or data.get("products", [])
-                    or data.get("data", {}).get("products", [])
-                    or [])
-        for p in products:
-            try:
-                pid = str(p.get("productId") or p.get("id") or "")
-                if not pid or pid in seen_ids: continue
-                seen_ids.add(pid)
+            # Делаем API-запрос изнутри браузера — он уже авторизован
+            endpoints = [
+                "https://api.uzum.uz/api/product/search?sortBy=DISCOUNT_DESC&size=60&page=0",
+                "https://api.uzum.uz/api/v1/product/search?sortBy=DISCOUNT_DESC&size=60&page=0",
+                "https://api.uzum.uz/api/main/root-categories",
+            ]
+            raw = None
+            for ep in endpoints:
+                try:
+                    raw = page.evaluate(f"""
+                        async () => {{
+                            const r = await fetch("{ep}", {{
+                                headers: {{
+                                    "Accept": "application/json",
+                                    "x-iid": "uzum-web"
+                                }}
+                            }});
+                            if (!r.ok) return null;
+                            return await r.json();
+                        }}
+                    """)
+                    if raw:
+                        log.info(f"[Uzum] Сработал endpoint: {ep[:60]}")
+                        break
+                except Exception as e:
+                    log.warning(f"[Uzum] {ep[:50]}: {e}")
+
+            br.close()
+
+            if not raw:
+                log.info("[Uzum] 0 акций — все endpoints вернули null")
+                return []
+
+            products = (raw.get("payload", {}).get("products", [])
+                        or raw.get("products", [])
+                        or raw.get("data", {}).get("products", [])
+                        or [])
+
+            log.info(f"[Uzum] Получено товаров из API: {len(products)}")
+
+            for p in products:
                 old = p.get("fullPrice") or p.get("originalPrice") or 0
                 new = p.get("purchasePrice") or p.get("price") or 0
                 if not old or not new or old <= new: continue
                 disc = round((old - new) / old * 100)
                 if disc < min_discount: continue
+                pid = str(p.get("productId") or p.get("id") or "")
                 photos = p.get("photos") or p.get("images") or []
                 img = (photos[0].get("high") or photos[0].get("url") or "") if photos else ""
-                slug = p.get("slug") or pid
                 deals.append({
                     "id": f"uzum_{pid}",
-                    "title": (p.get("title") or p.get("name") or "Товар Uzum")[:100],
+                    "title": (p.get("title") or p.get("name") or "Uzum товар")[:100],
                     "old_price": old, "new_price": new, "discount": disc,
-                    "url": f"https://uzum.uz/ru/product/{slug}",
+                    "url": f"https://uzum.uz/ru/product/{p.get('slug') or pid}",
                     "image": img, "shop": "Uzum.uz 🛍",
                 })
                 if len(deals) >= limit: break
-            except Exception: continue
-        if len(deals) >= limit: break
 
-    log.info(f"[Uzum] {len(deals)} акций (перехвачено {len(captured)} API-ответов)")
+    except Exception as e:
+        log.error(f"[Uzum] {e}")
+
+    log.info(f"[Uzum] {len(deals)} акций")
     return deals
 
 # ════════════════════════════════════════════════════════════
-#  OLCHA — перехватываем API
+#  OLCHA — вызываем API изнутри браузера
 # ════════════════════════════════════════════════════════════
 def parse_olcha(min_discount=20, limit=10) -> list[dict]:
-    captured = []
-
-    def on_response(resp):
-        try:
-            if ("olcha.uz" in resp.url and resp.status == 200
-                    and "product" in resp.url):
-                data = resp.json()
-                captured.append(data)
-        except Exception:
-            pass
-
+    deals = []
     try:
         with sync_playwright() as pw:
-            br = pw.chromium.launch(headless=True, args=_browser_args())
-            ctx = br.new_context(locale="ru-RU")
-            page = ctx.new_page()
-            page.on("response", on_response)
-            page.goto("https://olcha.uz/ru/category/all?sort=discount&order=desc",
-                      wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(3000)
-            br.close()
-    except Exception as e:
-        log.warning(f"[Olcha] Browser error: {e}")
+            br, page = _open_page(pw, "https://olcha.uz/ru/category/all?sort=discount", wait_ms=5000)
 
-    deals = []
-    seen_ids = set()
-    for data in captured:
-        products = (data.get("data", {}).get("products", [])
-                    or data.get("products", [])
-                    or data.get("items", [])
-                    or [])
-        for p in products:
-            try:
-                pid = str(p.get("id") or p.get("slug") or "")
-                if not pid or pid in seen_ids: continue
-                seen_ids.add(pid)
+            endpoints = [
+                "https://api.olcha.uz/v2/products?sort=discount&order=desc&limit=50&page=1",
+                "https://api.olcha.uz/v1/products?sort=discount&limit=50",
+                "https://olcha.uz/api/v2/products?sort=discount&limit=50",
+            ]
+            raw = None
+            for ep in endpoints:
+                try:
+                    raw = page.evaluate(f"""
+                        async () => {{
+                            const r = await fetch("{ep}", {{"headers": {{"Accept": "application/json"}}}});
+                            if (!r.ok) return null;
+                            return await r.json();
+                        }}
+                    """)
+                    if raw:
+                        log.info(f"[Olcha] Сработал: {ep[:60]}")
+                        break
+                except Exception: continue
+
+            br.close()
+
+            if not raw:
+                log.info("[Olcha] 0 акций")
+                return []
+
+            products = (raw.get("data", {}).get("products", [])
+                        or raw.get("products", [])
+                        or raw.get("items", [])
+                        or [])
+
+            log.info(f"[Olcha] Товаров из API: {len(products)}")
+
+            for p in products:
                 old = p.get("old_price") or p.get("base_price") or p.get("price_old") or 0
                 new = p.get("price") or p.get("sell_price") or p.get("price_new") or 0
                 if not old or not new or old <= new: continue
                 disc = round((old - new) / old * 100)
                 if disc < min_discount: continue
+                pid = str(p.get("id") or p.get("slug") or "")
                 imgs = p.get("images") or p.get("photos") or []
-                img = (imgs[0].get("url") or imgs[0].get("original") or "") if imgs else p.get("image", "")
-                slug = p.get("slug") or pid
+                img = (imgs[0].get("url") or "") if imgs else p.get("image", "")
                 deals.append({
                     "id": f"olcha_{pid}",
-                    "title": (p.get("name") or p.get("title") or "Товар Olcha")[:100],
+                    "title": (p.get("name") or p.get("title") or "Olcha товар")[:100],
                     "old_price": old, "new_price": new, "discount": disc,
-                    "url": f"https://olcha.uz/product/{slug}",
+                    "url": f"https://olcha.uz/product/{p.get('slug') or pid}",
                     "image": img, "shop": "Olcha.uz 🍑",
                 })
                 if len(deals) >= limit: break
-            except Exception: continue
-        if len(deals) >= limit: break
 
-    log.info(f"[Olcha] {len(deals)} акций (перехвачено {len(captured)} API-ответов)")
+    except Exception as e:
+        log.error(f"[Olcha] {e}")
+
+    log.info(f"[Olcha] {len(deals)} акций")
     return deals
 
 # ════════════════════════════════════════════════════════════
-#  TEXNOMART — перехватываем API
+#  TEXNOMART — вызываем API изнутри браузера
 # ════════════════════════════════════════════════════════════
 def parse_texnomart(min_discount=20, limit=10) -> list[dict]:
-    captured = []
-
-    def on_response(resp):
-        try:
-            if "texnomart.uz" in resp.url and resp.status == 200:
-                ct = resp.headers.get("content-type", "")
-                if "json" in ct:
-                    data = resp.json()
-                    captured.append((resp.url, data))
-        except Exception:
-            pass
-
+    deals = []
     try:
         with sync_playwright() as pw:
-            br = pw.chromium.launch(headless=True, args=_browser_args())
-            ctx = br.new_context(locale="ru-RU")
-            page = ctx.new_page()
-            page.on("response", on_response)
-            page.goto("https://texnomart.uz/ru/sales", wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(3000)
-            br.close()
-    except Exception as e:
-        log.warning(f"[Texnomart] Browser error: {e}")
+            br, page = _open_page(pw, "https://texnomart.uz/ru/sales", wait_ms=5000)
 
-    deals = []
-    seen_ids = set()
-    for url, data in captured:
-        log.info(f"[Texnomart] API: {url[:80]}")
-        products = (data.get("data", {}).get("products", [])
-                    or data.get("products", [])
-                    or data.get("items", [])
-                    or [])
-        for p in products:
-            try:
-                pid = str(p.get("id") or p.get("slug") or "")
-                if not pid or pid in seen_ids: continue
-                seen_ids.add(pid)
-                old = (p.get("old_price") or p.get("price_old")
-                       or p.get("base_price") or p.get("original_price") or 0)
-                new = p.get("price") or p.get("sell_price") or p.get("price_new") or 0
+            endpoints = [
+                "https://texnomart.uz/api/v1/products?sale=true&sort=discount&limit=50",
+                "https://texnomart.uz/api/products?special=sale&sort=discount&limit=50",
+                "https://api.texnomart.uz/v1/products?sale=1&sort=discount",
+            ]
+            raw = None
+            for ep in endpoints:
+                try:
+                    raw = page.evaluate(f"""
+                        async () => {{
+                            const r = await fetch("{ep}", {{"headers": {{"Accept": "application/json"}}}});
+                            if (!r.ok) return null;
+                            return await r.json();
+                        }}
+                    """)
+                    if raw:
+                        log.info(f"[Texnomart] Сработал: {ep[:60]}")
+                        break
+                except Exception: continue
+
+            br.close()
+
+            if not raw:
+                log.info("[Texnomart] 0 акций")
+                return []
+
+            products = (raw.get("data", {}).get("products", [])
+                        or raw.get("products", [])
+                        or raw.get("items", [])
+                        or [])
+
+            log.info(f"[Texnomart] Товаров: {len(products)}")
+
+            for p in products:
+                old = p.get("old_price") or p.get("price_old") or p.get("original_price") or 0
+                new = p.get("price") or p.get("sell_price") or 0
                 if not old or not new or old <= new: continue
                 disc = round((old - new) / old * 100)
                 if disc < min_discount: continue
+                pid = str(p.get("id") or p.get("slug") or "")
                 imgs = p.get("images") or p.get("photos") or []
-                img = (imgs[0].get("url") or imgs[0].get("src") or "") if imgs else p.get("image", "")
-                slug = p.get("slug") or pid
+                img = (imgs[0].get("url") or "") if imgs else p.get("image", "")
                 deals.append({
                     "id": f"txm_{pid}",
-                    "title": (p.get("name") or p.get("title") or "Товар Texnomart")[:100],
+                    "title": (p.get("name") or p.get("title") or "Texnomart товар")[:100],
                     "old_price": old, "new_price": new, "discount": disc,
-                    "url": f"https://texnomart.uz/ru/product/{slug}",
+                    "url": f"https://texnomart.uz/ru/product/{p.get('slug') or pid}",
                     "image": img, "shop": "Texnomart.uz 📺",
                 })
                 if len(deals) >= limit: break
-            except Exception: continue
-        if len(deals) >= limit: break
+
+    except Exception as e:
+        log.error(f"[Texnomart] {e}")
 
     log.info(f"[Texnomart] {len(deals)} акций")
     return deals
@@ -228,15 +249,13 @@ def parse_texnomart(min_discount=20, limit=10) -> list[dict]:
 # ════════════════════════════════════════════════════════════
 #  АГРЕГАТОР
 # ════════════════════════════════════════════════════════════
-ALL_PARSERS = [parse_uzum, parse_olcha, parse_texnomart]
-
 def fetch_all_sync() -> list[dict]:
     result = []
-    for fn in ALL_PARSERS:
+    for fn in [parse_uzum, parse_olcha, parse_texnomart]:
         try:
             result.extend(fn(min_discount=MIN_DISCOUNT, limit=LIMIT_PER_SHOP))
         except Exception as e:
-            log.error(f"Парсер {fn.__name__}: {e}")
+            log.error(f"{fn.__name__}: {e}")
     result.sort(key=lambda d: d["discount"], reverse=True)
     return result
 
@@ -271,7 +290,7 @@ def kb(deal_id: str) -> InlineKeyboardMarkup:
     ]])
 
 async def check_and_notify():
-    log.info("Запускаю парсеры (перехват API)...")
+    log.info("Старт проверки...")
     seen = load_seen()
     deals = await asyncio.to_thread(fetch_all_sync)
     log.info(f"Итого: {len(deals)} акций")
@@ -295,20 +314,19 @@ async def check_and_notify():
 
     save_seen(seen)
     if new_count:
-        await bot.send_message(ADMIN_ID,
-            f"✅ Готово. Новых акций: *{new_count}*", parse_mode="Markdown")
+        await bot.send_message(ADMIN_ID, f"✅ Новых акций: *{new_count}*", parse_mode="Markdown")
     else:
         await bot.send_message(ADMIN_ID,
-            "🤷 Акций не найдено.\n\nСмотрите логи в Railway — "
-            "там будут строки `[Uzum] API:` с реальными URL которые перехватили. "
-            "Скиньте их мне.", parse_mode="Markdown")
+            "🤷 0 акций. Смотрите логи в Railway — "
+            "там написано какие endpoints сработали. Скиньте мне логи.",
+            parse_mode="Markdown")
 
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     if msg.from_user.id != ADMIN_ID: return
     await msg.answer(
         f"👋 *Бот запущен!*\n\n"
-        f"🌐 Режим: перехват API через Playwright\n"
+        f"🌐 Режим: fetch изнутри браузера\n"
         f"🏪 Uzum | Olcha | Texnomart\n"
         f"⏱ Каждые *{CHECK_HOURS} ч.* | 💥 Мин. скидка *{MIN_DISCOUNT}%*\n\n"
         f"/check — проверить сейчас\n/stats — статистика",
@@ -317,14 +335,14 @@ async def cmd_start(msg: Message):
 @dp.message(Command("check"))
 async def cmd_check(msg: Message):
     if msg.from_user.id != ADMIN_ID: return
-    await msg.answer("🔍 Открываю сайты, перехватываю API... (~1 мин)")
+    await msg.answer("🔍 Запускаю браузеры... (~2 мин)")
     await check_and_notify()
 
 @dp.message(Command("stats"))
 async def cmd_stats(msg: Message):
     if msg.from_user.id != ADMIN_ID: return
     await msg.answer(
-        f"📊 Просмотрено: *{len(load_seen())}*\nОжидают одобрения: *{len(pending)}*",
+        f"📊 Просмотрено: *{len(load_seen())}*\nОжидают: *{len(pending)}*",
         parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("pub:"))
