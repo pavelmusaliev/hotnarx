@@ -1,8 +1,4 @@
-import asyncio
-import json
-import logging
-import os
-import re
+import asyncio, json, logging, os, re
 from pathlib import Path
 
 import requests
@@ -29,188 +25,273 @@ log = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
-# ════════════════════════════════════════════════════════════
-#  ПАРСЕРЫ
-# ════════════════════════════════════════════════════════════
-
 BROWSER = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+JSON_HDR = {**BROWSER, "Accept": "application/json, text/plain, */*"}
 
 def _price(text: str) -> int:
     d = re.sub(r"[^\d]", "", text or "")
     return int(d) if d else 0
 
-
+# ════════════════════════════════════════════════════════════
+#  UZUM — парсим HTML страницу акций
+# ════════════════════════════════════════════════════════════
 def parse_uzum(min_discount=30, limit=10) -> list[dict]:
-    try:
-        r = requests.get(
-            "https://api.uzum.uz/api/product/search",
-            headers={**BROWSER, "Origin": "https://uzum.uz", "Referer": "https://uzum.uz/", "Accept": "application/json"},
-            params={"sortBy": "DISCOUNT_DESC", "size": 60, "page": 0},
-            timeout=20,
-        )
-        r.raise_for_status()
-        products = r.json().get("payload", {}).get("products", []) or r.json().get("products", []) or []
-    except Exception as e:
-        log.error(f"[Uzum] {e}"); return []
-
     deals = []
-    for p in products:
-        old = p.get("fullPrice") or p.get("originalPrice") or 0
-        new = p.get("purchasePrice") or p.get("price") or 0
-        if not old or not new or old <= new: continue
-        disc = round((old - new) / old * 100)
-        if disc < min_discount: continue
-        pid = str(p.get("productId") or p.get("id") or "")
-        photos = p.get("photos") or p.get("images") or []
-        img = (photos[0].get("high") or photos[0].get("url") or "") if photos else ""
-        deals.append({"id": f"uzum_{pid}", "title": (p.get("title") or "")[:100],
-                      "old_price": old, "new_price": new, "discount": disc,
-                      "url": f"https://uzum.uz/product/{p.get('slug') or pid}",
-                      "image": img, "shop": "Uzum.uz 🛍"})
-        if len(deals) >= limit: break
-    log.info(f"[Uzum] {len(deals)} акций"); return deals
-
-
-def parse_wildberries(min_discount=30, limit=10) -> list[dict]:
-    categories = [("Одежда", 306), ("Электроника", 6119), ("Обувь", 4764)]
-    deals, seen = [], set()
-    for cat_name, cat_id in categories:
-        if len(deals) >= limit: break
+    urls = [
+        "https://uzum.uz/ru/promotions",
+        "https://uzum.uz/ru/category/vse-tovary?sortBy=DISCOUNT_DESC",
+    ]
+    for url in urls:
+        if deals: break
         try:
-            r = requests.get(
-                "https://catalog.wb.ru/catalog/sale/catalog",
-                headers={**BROWSER, "Origin": "https://www.wildberries.ru", "Referer": "https://www.wildberries.ru/"},
-                params={"appType": 1, "curr": "uzs", "dest": -1257786, "sort": "sale", "spp": 30, "page": 1, "cat": cat_id},
-                timeout=20,
-            )
-            products = r.json().get("data", {}).get("products", []) or []
+            r = requests.get(url, headers=BROWSER, timeout=25)
+            if r.status_code != 200: continue
+            soup = BeautifulSoup(r.text, "lxml")
+
+            # Ищем JSON с данными (Next.js паттерн)
+            for script in soup.find_all("script", id="__NEXT_DATA__"):
+                try:
+                    data = json.loads(script.string)
+                    # Ходим вглубь в поисках массива products
+                    text = json.dumps(data)
+                    # Ищем пары fullPrice/purchasePrice
+                    items = re.findall(
+                        r'"title"\s*:\s*"([^"]+)".*?"fullPrice"\s*:\s*(\d+).*?"purchasePrice"\s*:\s*(\d+)',
+                        text
+                    )
+                    for title, old_s, new_s in items[:limit*2]:
+                        old, new = int(old_s), int(new_s)
+                        if old <= new: continue
+                        disc = round((old-new)/old*100)
+                        if disc < min_discount: continue
+                        deals.append({
+                            "id": f"uzum_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
+                            "title": title[:100], "old_price": old, "new_price": new,
+                            "discount": disc, "url": "https://uzum.uz/ru/promotions",
+                            "image": "", "shop": "Uzum.uz 🛍"
+                        })
+                        if len(deals) >= limit: break
+                except Exception: continue
+
+            # Fallback: карточки в HTML
+            if not deals:
+                for card in soup.select("[class*='product'], [class*='ProductCard'], article")[:50]:
+                    try:
+                        t = card.select_one("[class*='title'],[class*='name'],h2,h3,h4")
+                        title = t.get_text(strip=True) if t else ""
+                        if not title or len(title) < 3: continue
+                        old_el = card.select_one("[class*='old'],[class*='cross'],del,s")
+                        new_el = card.select_one("[class*='current'],[class*='new'],[class*='sale'],[class*='price']")
+                        old = _price(old_el.get_text() if old_el else "")
+                        new = _price(new_el.get_text() if new_el else "")
+                        if not old or not new or old <= new: continue
+                        disc = round((old-new)/old*100)
+                        if disc < min_discount: continue
+                        a = card.select_one("a[href]")
+                        href = a["href"] if a else ""
+                        link = href if href.startswith("http") else f"https://uzum.uz{href}"
+                        img = (card.select_one("img") or {})
+                        img_src = img.get("data-src") or img.get("src") or "" if img else ""
+                        deals.append({
+                            "id": f"uzum_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
+                            "title": title[:100], "old_price": old, "new_price": new,
+                            "discount": disc, "url": link, "image": img_src, "shop": "Uzum.uz 🛍"
+                        })
+                        if len(deals) >= limit: break
+                    except Exception: continue
         except Exception as e:
-            log.warning(f"[WB] {cat_name}: {e}"); continue
-        for p in products:
-            pid = int(p.get("id", 0))
-            if not pid or pid in seen: continue
-            seen.add(pid)
-            disc = p.get("sale", 0)
-            if disc < min_discount: continue
-            old = round((p.get("priceU") or 0) / 100)
-            new = round((p.get("salePriceU") or 0) / 100)
-            if not old or not new or old <= new: continue
-            vol = pid // 100_000
-            img = f"https://basket-{str(vol).zfill(2)}.wb.ru/vol{vol}/part{pid//1000}/{pid}/images/tm/1.jpg"
-            brand = p.get("brand", "")
-            title = f"{brand} — {p.get('name','')}" if brand else p.get("name", "")
-            deals.append({"id": f"wb_{pid}", "title": title[:100],
-                          "old_price": old, "new_price": new, "discount": disc,
-                          "url": f"https://www.wildberries.ru/catalog/{pid}/detail.aspx",
-                          "image": img, "shop": f"Wildberries 🍇 ({cat_name})"})
-            if len(deals) >= limit: break
-    log.info(f"[WB] {len(deals)} акций"); return deals
+            log.warning(f"[Uzum] {e}")
+    log.info(f"[Uzum] {len(deals)} акций")
+    return deals
 
-
-def _html_deals(url, shop_label, shop_prefix, min_discount, limit) -> list[dict]:
-    """Универсальный HTML-парсер для Korzinka / Texnomart / MediaPark."""
-    try:
-        r = requests.get(url, headers=BROWSER, timeout=20)
-        if r.status_code != 200 or len(r.text) < 3000: return []
-        soup = BeautifulSoup(r.text, "lxml")
-    except Exception as e:
-        log.warning(f"[{shop_label}] {e}"); return []
-
-    cards = (soup.select(".product-card") or soup.select(".catalog-item")
-             or soup.select(".product-item") or soup.select("article"))
-
-    deals = []
-    for card in cards:
-        try:
-            t = card.select_one("h2,h3,h4,.product-name,.item-name,.name,.title")
-            title = t.get_text(strip=True) if t else ""
-            if not title or len(title) < 3: continue
-
-            old_el = card.select_one(".old-price,.price-old,del,s,[class*='old']")
-            new_el = card.select_one(".new-price,.price-new,.current-price,[class*='current'],[class*='new'],.price")
-            old = _price(old_el.get_text() if old_el else "")
-            new = _price(new_el.get_text() if new_el else "")
-            if not old or not new or old <= new: continue
-
-            disc = round((old - new) / old * 100)
-            if disc < min_discount: continue
-
-            a = card.select_one("a[href]")
-            href = a["href"] if a else ""
-            base = url.split("/", 3)[:3]; base = "/".join(base)
-            link = href if href.startswith("http") else f"{base}{href}"
-
-            img_el = card.select_one("img")
-            img = ""
-            if img_el:
-                img = img_el.get("data-src") or img_el.get("data-lazy") or img_el.get("src") or ""
-                if img.startswith("//"): img = "https:" + img
-                elif img and not img.startswith("http"): img = base + img
-
-            deals.append({"id": f"{shop_prefix}_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
-                          "title": title[:100], "old_price": old, "new_price": new,
-                          "discount": disc, "url": link or url, "image": img, "shop": shop_label})
-            if len(deals) >= limit: break
-        except Exception: continue
-    log.info(f"[{shop_label}] {len(deals)} акций"); return deals
-
-
+# ════════════════════════════════════════════════════════════
+#  KORZINKA
+# ════════════════════════════════════════════════════════════
 def parse_korzinka(min_discount=20, limit=10) -> list[dict]:
-    for url in ["https://korzinka.uz/ru/promotions", "https://korzinka.uz/ru/actions"]:
-        d = _html_deals(url, "Korzinka.uz 🛒", "kzk", min_discount, limit)
-        if d: return d
-    return []
-
-def parse_texnomart(min_discount=20, limit=10) -> list[dict]:
-    for url in ["https://texnomart.uz/ru/sales", "https://texnomart.uz/ru/promotions"]:
-        d = _html_deals(url, "Texnomart.uz 📺", "txm", min_discount, limit)
-        if d: return d
-    return []
-
-def parse_mediapark(min_discount=20, limit=10) -> list[dict]:
-    for url in ["https://mediapark.uz/ru/sales", "https://mediapark.uz/ru/promotions"]:
-        d = _html_deals(url, "MediaPark.uz 🖥", "mp", min_discount, limit)
-        if d: return d
-    return []
-
-def parse_olx(min_discount=30, limit=10) -> list[dict]:
     deals = []
-    for url in ["https://www.olx.uz/ru/elektronika/", "https://www.olx.uz/ru/moda-i-stil/"]:
-        if len(deals) >= limit: break
+    for url in ["https://korzinka.uz/ru/promotions", "https://korzinka.uz/ru/catalog"]:
+        if deals: break
         try:
             r = requests.get(url, headers=BROWSER, timeout=20)
+            if r.status_code != 200 or len(r.text) < 2000: continue
             soup = BeautifulSoup(r.text, "lxml")
-        except Exception: continue
-        for card in soup.select("[data-cy='l-card'], .offer-wrapper, article"):
-            try:
-                t = card.select_one("h6,h3,[data-testid='ad-title'],.title-cell strong")
-                title = t.get_text(strip=True) if t else ""
-                if not title: continue
-                old_el = card.select_one("[data-testid='old-price'],.old-price")
-                new_el = card.select_one("[data-testid='ad-price'],.price strong")
-                old = _price(old_el.get_text() if old_el else "")
-                new = _price(new_el.get_text() if new_el else "")
-                if not old or not new or old <= new: continue
-                disc = round((old - new) / old * 100)
-                if disc < min_discount: continue
-                a = card.select_one("a[href]")
-                href = a["href"] if a else ""
-                link = href if href.startswith("http") else f"https://www.olx.uz{href}"
-                img_el = card.select_one("img")
-                img = (img_el.get("data-src") or img_el.get("src") or "") if img_el else ""
-                deals.append({"id": f"olx_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
-                              "title": title[:100], "old_price": old, "new_price": new,
-                              "discount": disc, "url": link, "image": img, "shop": "OLX.uz 📋"})
-                if len(deals) >= limit: break
-            except Exception: continue
-    log.info(f"[OLX] {len(deals)} акций"); return deals
+            for card in soup.select(".product-card, [class*='product'], article")[:60]:
+                try:
+                    t = card.select_one("h2,h3,h4,[class*='name'],[class*='title']")
+                    title = t.get_text(strip=True) if t else ""
+                    if not title or len(title) < 3: continue
+                    old_el = card.select_one("[class*='old'],del,s")
+                    new_el = card.select_one("[class*='new'],[class*='current'],[class*='price']")
+                    old = _price(old_el.get_text() if old_el else "")
+                    new = _price(new_el.get_text() if new_el else "")
+                    if not old or not new or old <= new: continue
+                    disc = round((old-new)/old*100)
+                    if disc < min_discount: continue
+                    a = card.select_one("a[href]")
+                    href = a["href"] if a else ""
+                    link = href if href.startswith("http") else f"https://korzinka.uz{href}"
+                    img_el = card.select_one("img")
+                    img = (img_el.get("data-src") or img_el.get("src") or "") if img_el else ""
+                    deals.append({"id": f"kzk_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
+                                  "title": title[:100], "old_price": old, "new_price": new,
+                                  "discount": disc, "url": link, "image": img, "shop": "Korzinka.uz 🛒"})
+                    if len(deals) >= limit: break
+                except Exception: continue
+        except Exception as e:
+            log.warning(f"[Korzinka] {e}")
+    log.info(f"[Korzinka] {len(deals)} акций")
+    return deals
 
+# ════════════════════════════════════════════════════════════
+#  TEXNOMART
+# ════════════════════════════════════════════════════════════
+def parse_texnomart(min_discount=20, limit=10) -> list[dict]:
+    deals = []
+    for url in ["https://texnomart.uz/ru/sales", "https://texnomart.uz/ru/catalog?special=sale",
+                "https://texnomart.uz/ru/promotions"]:
+        if deals: break
+        try:
+            r = requests.get(url, headers=BROWSER, timeout=20)
+            if r.status_code != 200 or len(r.text) < 2000: continue
+            soup = BeautifulSoup(r.text, "lxml")
+            for card in soup.select(".product-card,.item-card,[class*='product'],article")[:60]:
+                try:
+                    t = card.select_one("h2,h3,h4,[class*='name'],[class*='title']")
+                    title = t.get_text(strip=True) if t else ""
+                    if not title or len(title) < 3: continue
+                    old_el = card.select_one("[class*='old'],del,s")
+                    new_el = card.select_one("[class*='current'],[class*='new'],[class*='price']")
+                    old = _price(old_el.get_text() if old_el else "")
+                    new = _price(new_el.get_text() if new_el else "")
+                    if not old or not new or old <= new: continue
+                    disc = round((old-new)/old*100)
+                    if disc < min_discount: continue
+                    a = card.select_one("a[href]")
+                    href = a["href"] if a else ""
+                    link = href if href.startswith("http") else f"https://texnomart.uz{href}"
+                    img_el = card.select_one("img")
+                    img = (img_el.get("data-src") or img_el.get("src") or "") if img_el else ""
+                    deals.append({"id": f"txm_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
+                                  "title": title[:100], "old_price": old, "new_price": new,
+                                  "discount": disc, "url": link, "image": img, "shop": "Texnomart.uz 📺"})
+                    if len(deals) >= limit: break
+                except Exception: continue
+        except Exception as e:
+            log.warning(f"[Texnomart] {e}")
+    log.info(f"[Texnomart] {len(deals)} акций")
+    return deals
 
-ALL_PARSERS = [parse_uzum, parse_wildberries, parse_korzinka,
-               parse_texnomart, parse_mediapark, parse_olx]
+# ════════════════════════════════════════════════════════════
+#  MEDIAPARK
+# ════════════════════════════════════════════════════════════
+def parse_mediapark(min_discount=20, limit=10) -> list[dict]:
+    deals = []
+    for url in ["https://mediapark.uz/ru/sales", "https://mediapark.uz/ru/promotions",
+                "https://mediapark.uz/ru/catalog?sale=1"]:
+        if deals: break
+        try:
+            r = requests.get(url, headers=BROWSER, timeout=20)
+            if r.status_code != 200 or len(r.text) < 2000: continue
+            soup = BeautifulSoup(r.text, "lxml")
+            for card in soup.select(".product-card,[class*='product'],article,.item")[:60]:
+                try:
+                    t = card.select_one("h2,h3,h4,[class*='name'],[class*='title']")
+                    title = t.get_text(strip=True) if t else ""
+                    if not title or len(title) < 3: continue
+                    old_el = card.select_one("[class*='old'],del,s")
+                    new_el = card.select_one("[class*='current'],[class*='new'],[class*='price']")
+                    old = _price(old_el.get_text() if old_el else "")
+                    new = _price(new_el.get_text() if new_el else "")
+                    if not old or not new or old <= new: continue
+                    disc = round((old-new)/old*100)
+                    if disc < min_discount: continue
+                    a = card.select_one("a[href]")
+                    href = a["href"] if a else ""
+                    link = href if href.startswith("http") else f"https://mediapark.uz{href}"
+                    img_el = card.select_one("img")
+                    img = (img_el.get("data-src") or img_el.get("src") or "") if img_el else ""
+                    deals.append({"id": f"mp_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
+                                  "title": title[:100], "old_price": old, "new_price": new,
+                                  "discount": disc, "url": link, "image": img, "shop": "MediaPark.uz 🖥"})
+                    if len(deals) >= limit: break
+                except Exception: continue
+        except Exception as e:
+            log.warning(f"[MediaPark] {e}")
+    log.info(f"[MediaPark] {len(deals)} акций")
+    return deals
+
+# ════════════════════════════════════════════════════════════
+#  OLCHA.UZ — работающий альтернатива Uzum с открытым API
+# ════════════════════════════════════════════════════════════
+def parse_olcha(min_discount=20, limit=10) -> list[dict]:
+    """Olcha.uz — крупный узбекский маркетплейс с доступным API."""
+    deals = []
+    try:
+        r = requests.get(
+            "https://api.olcha.uz/v2/products",
+            headers={**JSON_HDR, "Origin": "https://olcha.uz", "Referer": "https://olcha.uz/"},
+            params={"sort": "discount", "order": "desc", "limit": 50, "page": 1},
+            timeout=20,
+        )
+        if r.status_code != 200: raise Exception(f"HTTP {r.status_code}")
+        data = r.json()
+        products = data.get("data", {}).get("products", []) or data.get("products", []) or []
+        for p in products:
+            old = p.get("old_price") or p.get("base_price") or 0
+            new = p.get("price") or p.get("sell_price") or 0
+            if not old or not new or old <= new: continue
+            disc = round((old-new)/old*100)
+            if disc < min_discount: continue
+            pid = str(p.get("id") or p.get("slug") or "")
+            slug = p.get("slug") or pid
+            imgs = p.get("images") or p.get("photos") or []
+            img = (imgs[0].get("url") or imgs[0].get("original") or "") if imgs else ""
+            deals.append({
+                "id": f"olcha_{pid}",
+                "title": (p.get("name") or p.get("title") or "")[:100],
+                "old_price": old, "new_price": new, "discount": disc,
+                "url": f"https://olcha.uz/product/{slug}",
+                "image": img, "shop": "Olcha.uz 🍑"
+            })
+            if len(deals) >= limit: break
+    except Exception as e:
+        log.warning(f"[Olcha] {e}")
+        # Fallback через HTML
+        try:
+            r = requests.get("https://olcha.uz/ru/sales", headers=BROWSER, timeout=20)
+            soup = BeautifulSoup(r.text, "lxml")
+            for card in soup.select("[class*='product'],[class*='Product'],article")[:40]:
+                try:
+                    t = card.select_one("h2,h3,h4,[class*='name'],[class*='title']")
+                    title = t.get_text(strip=True) if t else ""
+                    if not title or len(title) < 3: continue
+                    old_el = card.select_one("[class*='old'],del,s")
+                    new_el = card.select_one("[class*='new'],[class*='current'],[class*='price']")
+                    old = _price(old_el.get_text() if old_el else "")
+                    new = _price(new_el.get_text() if new_el else "")
+                    if not old or not new or old <= new: continue
+                    disc = round((old-new)/old*100)
+                    if disc < min_discount: continue
+                    a = card.select_one("a[href]")
+                    href = (a["href"] if a else "")
+                    link = href if href.startswith("http") else f"https://olcha.uz{href}"
+                    deals.append({"id": f"olcha_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
+                                  "title": title[:100], "old_price": old, "new_price": new,
+                                  "discount": disc, "url": link, "image": "", "shop": "Olcha.uz 🍑"})
+                    if len(deals) >= limit: break
+                except Exception: continue
+        except Exception: pass
+    log.info(f"[Olcha] {len(deals)} акций")
+    return deals
+
+# ════════════════════════════════════════════════════════════
+#  АГРЕГАТОР
+# ════════════════════════════════════════════════════════════
+ALL_PARSERS = [parse_uzum, parse_olcha, parse_korzinka, parse_texnomart, parse_mediapark]
 
 def fetch_all() -> list[dict]:
     result = []
@@ -220,11 +301,9 @@ def fetch_all() -> list[dict]:
     result.sort(key=lambda d: d["discount"], reverse=True)
     return result
 
-
 # ════════════════════════════════════════════════════════════
 #  БОТ
 # ════════════════════════════════════════════════════════════
-
 def load_seen() -> set:
     return set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
 
@@ -254,6 +333,7 @@ async def check_and_notify():
     log.info("Запускаю все парсеры...")
     seen = load_seen()
     deals = fetch_all()
+    log.info(f"Итого найдено: {len(deals)} акций")
     new_count = 0
     for d in deals:
         if d["id"] in seen: continue
@@ -272,14 +352,14 @@ async def check_and_notify():
     if new_count:
         await bot.send_message(ADMIN_ID, f"✅ Готово. Новых акций: *{new_count}*", parse_mode="Markdown")
     else:
-        log.info("Новых акций не найдено.")
+        await bot.send_message(ADMIN_ID, "🤷 Новых акций не найдено. Магазины либо закрыли доступ, либо акций нет.")
 
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     if msg.from_user.id != ADMIN_ID: return
     await msg.answer(
         f"👋 *Бот запущен!*\n\n"
-        f"🏪 Uzum | Wildberries | Korzinka | Texnomart | MediaPark | OLX\n"
+        f"🏪 Uzum | Olcha | Korzinka | Texnomart | MediaPark\n"
         f"⏱ Каждые *{CHECK_HOURS} ч.* | 💥 Мин. скидка *{MIN_DISCOUNT}%*\n\n"
         f"/check — проверить сейчас\n/stats — статистика",
         parse_mode="Markdown")
@@ -287,7 +367,7 @@ async def cmd_start(msg: Message):
 @dp.message(Command("check"))
 async def cmd_check(msg: Message):
     if msg.from_user.id != ADMIN_ID: return
-    await msg.answer("🔍 Парсю 6 магазинов...")
+    await msg.answer("🔍 Парсю магазины...")
     await check_and_notify()
 
 @dp.message(Command("stats"))
