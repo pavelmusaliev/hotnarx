@@ -1,8 +1,7 @@
 import asyncio, json, logging, os, re
 from pathlib import Path
 
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -26,204 +25,202 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 def _price(text: str) -> int:
-    d = re.sub(r"[^\d]", "", text or "")
+    d = re.sub(r"[^\d]", "", str(text or ""))
     return int(d) if d else 0
 
-# ════════════════════════════════════════════════════════════
-#  Базовая функция: открыть страницу через Playwright
-# ════════════════════════════════════════════════════════════
-def _get_soup(url: str, wait_selector: str = None, timeout: int = 20000) -> BeautifulSoup | None:
-    """Открывает страницу через headless Chromium, ждёт загрузки JS, возвращает BeautifulSoup."""
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            page = browser.new_page(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                locale="ru-RU",
-            )
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-
-            if wait_selector:
-                try:
-                    page.wait_for_selector(wait_selector, timeout=8000)
-                except PWTimeout:
-                    pass  # продолжаем даже если селектор не появился
-            else:
-                page.wait_for_timeout(3000)  # ждём 3 сек для JS
-
-            html = page.content()
-            browser.close()
-            return BeautifulSoup(html, "lxml")
-    except Exception as e:
-        log.warning(f"Playwright ошибка [{url}]: {e}")
-        return None
+def _browser_args():
+    return ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-blink-features=AutomationControlled"]
 
 # ════════════════════════════════════════════════════════════
-#  UZUM.UZ
+#  UZUM — перехватываем API-ответы которые сайт сам запрашивает
 # ════════════════════════════════════════════════════════════
 def parse_uzum(min_discount=30, limit=10) -> list[dict]:
-    deals = []
-    soup = _get_soup(
-        "https://uzum.uz/ru/promotions",
-        wait_selector="[class*='ProductCard'], [class*='product-card'], article",
-    )
-    if not soup:
-        log.info("[Uzum] 0 акций (страница не загрузилась)")
-        return []
+    captured = []
 
-    selectors = [
-        "[class*='ProductCard']", "[class*='product-card']",
-        "[class*='product_card']", "article", "[class*='ProductItem']",
-    ]
-    cards = []
-    for sel in selectors:
-        cards = soup.select(sel)
-        if cards: break
-
-    for card in cards[:60]:
+    def on_response(resp):
         try:
-            t = card.select_one("[class*='title'],[class*='name'],[class*='Title'],[class*='Name'],h2,h3,h4")
-            title = t.get_text(strip=True) if t else ""
-            if not title or len(title) < 3: continue
+            if "api.uzum.uz" in resp.url and resp.status == 200:
+                if any(k in resp.url for k in ["search", "product", "promotion", "campaign"]):
+                    data = resp.json()
+                    captured.append(data)
+        except Exception:
+            pass
 
-            old_el = card.select_one("[class*='old'],[class*='Old'],[class*='cross'],del,s")
-            new_el = card.select_one("[class*='current'],[class*='Current'],[class*='new'],[class*='sale'],[class*='Sale']")
-            old = _price(old_el.get_text() if old_el else "")
-            new = _price(new_el.get_text() if new_el else "")
-            if not old or not new or old <= new: continue
+    try:
+        with sync_playwright() as pw:
+            br = pw.chromium.launch(headless=True, args=_browser_args())
+            ctx = br.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+                locale="ru-RU",
+            )
+            page = ctx.new_page()
+            page.on("response", on_response)
+            page.goto("https://uzum.uz/ru/promotions", wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+            br.close()
+    except Exception as e:
+        log.warning(f"[Uzum] Browser error: {e}")
 
-            disc = round((old - new) / old * 100)
-            if disc < min_discount: continue
+    # Ищем товары во всех перехваченных ответах
+    deals = []
+    seen_ids = set()
+    for data in captured:
+        raw_text = json.dumps(data)
+        # Рекурсивно ищем массивы с товарами
+        products = (data.get("payload", {}).get("products", [])
+                    or data.get("products", [])
+                    or data.get("data", {}).get("products", [])
+                    or [])
+        for p in products:
+            try:
+                pid = str(p.get("productId") or p.get("id") or "")
+                if not pid or pid in seen_ids: continue
+                seen_ids.add(pid)
+                old = p.get("fullPrice") or p.get("originalPrice") or 0
+                new = p.get("purchasePrice") or p.get("price") or 0
+                if not old or not new or old <= new: continue
+                disc = round((old - new) / old * 100)
+                if disc < min_discount: continue
+                photos = p.get("photos") or p.get("images") or []
+                img = (photos[0].get("high") or photos[0].get("url") or "") if photos else ""
+                slug = p.get("slug") or pid
+                deals.append({
+                    "id": f"uzum_{pid}",
+                    "title": (p.get("title") or p.get("name") or "Товар Uzum")[:100],
+                    "old_price": old, "new_price": new, "discount": disc,
+                    "url": f"https://uzum.uz/ru/product/{slug}",
+                    "image": img, "shop": "Uzum.uz 🛍",
+                })
+                if len(deals) >= limit: break
+            except Exception: continue
+        if len(deals) >= limit: break
 
-            a = card.select_one("a[href]")
-            href = a["href"] if a else ""
-            link = href if href.startswith("http") else f"https://uzum.uz{href}"
-
-            img_el = card.select_one("img")
-            img = (img_el.get("src") or img_el.get("data-src") or "") if img_el else ""
-
-            deals.append({"id": f"uzum_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
-                          "title": title[:100], "old_price": old, "new_price": new,
-                          "discount": disc, "url": link, "image": img, "shop": "Uzum.uz 🛍"})
-            if len(deals) >= limit: break
-        except Exception: continue
-
-    log.info(f"[Uzum] {len(deals)} акций")
+    log.info(f"[Uzum] {len(deals)} акций (перехвачено {len(captured)} API-ответов)")
     return deals
 
 # ════════════════════════════════════════════════════════════
-#  OLCHA.UZ
+#  OLCHA — перехватываем API
 # ════════════════════════════════════════════════════════════
 def parse_olcha(min_discount=20, limit=10) -> list[dict]:
-    deals = []
-    soup = _get_soup(
-        "https://olcha.uz/ru/category/all?sort=discount",
-        wait_selector="[class*='product'], [class*='Product'], article",
-    )
-    if not soup:
-        log.info("[Olcha] 0 акций")
-        return []
+    captured = []
 
-    cards = soup.select("[class*='product-card'],[class*='ProductCard'],[class*='product_card'],article")
-    for card in cards[:60]:
+    def on_response(resp):
         try:
-            t = card.select_one("[class*='name'],[class*='title'],h2,h3,h4")
-            title = t.get_text(strip=True) if t else ""
-            if not title or len(title) < 3: continue
+            if ("olcha.uz" in resp.url and resp.status == 200
+                    and "product" in resp.url):
+                data = resp.json()
+                captured.append(data)
+        except Exception:
+            pass
 
-            old_el = card.select_one("[class*='old'],del,s,[class*='crossed']")
-            new_el = card.select_one("[class*='current'],[class*='new'],[class*='sale'],[class*='price']")
-            old = _price(old_el.get_text() if old_el else "")
-            new = _price(new_el.get_text() if new_el else "")
-            if not old or not new or old <= new: continue
+    try:
+        with sync_playwright() as pw:
+            br = pw.chromium.launch(headless=True, args=_browser_args())
+            ctx = br.new_context(locale="ru-RU")
+            page = ctx.new_page()
+            page.on("response", on_response)
+            page.goto("https://olcha.uz/ru/category/all?sort=discount&order=desc",
+                      wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+            br.close()
+    except Exception as e:
+        log.warning(f"[Olcha] Browser error: {e}")
 
-            disc = round((old - new) / old * 100)
-            if disc < min_discount: continue
+    deals = []
+    seen_ids = set()
+    for data in captured:
+        products = (data.get("data", {}).get("products", [])
+                    or data.get("products", [])
+                    or data.get("items", [])
+                    or [])
+        for p in products:
+            try:
+                pid = str(p.get("id") or p.get("slug") or "")
+                if not pid or pid in seen_ids: continue
+                seen_ids.add(pid)
+                old = p.get("old_price") or p.get("base_price") or p.get("price_old") or 0
+                new = p.get("price") or p.get("sell_price") or p.get("price_new") or 0
+                if not old or not new or old <= new: continue
+                disc = round((old - new) / old * 100)
+                if disc < min_discount: continue
+                imgs = p.get("images") or p.get("photos") or []
+                img = (imgs[0].get("url") or imgs[0].get("original") or "") if imgs else p.get("image", "")
+                slug = p.get("slug") or pid
+                deals.append({
+                    "id": f"olcha_{pid}",
+                    "title": (p.get("name") or p.get("title") or "Товар Olcha")[:100],
+                    "old_price": old, "new_price": new, "discount": disc,
+                    "url": f"https://olcha.uz/product/{slug}",
+                    "image": img, "shop": "Olcha.uz 🍑",
+                })
+                if len(deals) >= limit: break
+            except Exception: continue
+        if len(deals) >= limit: break
 
-            a = card.select_one("a[href]")
-            href = a["href"] if a else ""
-            link = href if href.startswith("http") else f"https://olcha.uz{href}"
-            img_el = card.select_one("img")
-            img = (img_el.get("src") or img_el.get("data-src") or "") if img_el else ""
-
-            deals.append({"id": f"olcha_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
-                          "title": title[:100], "old_price": old, "new_price": new,
-                          "discount": disc, "url": link, "image": img, "shop": "Olcha.uz 🍑"})
-            if len(deals) >= limit: break
-        except Exception: continue
-
-    log.info(f"[Olcha] {len(deals)} акций")
+    log.info(f"[Olcha] {len(deals)} акций (перехвачено {len(captured)} API-ответов)")
     return deals
 
 # ════════════════════════════════════════════════════════════
-#  KORZINKA.UZ
-# ════════════════════════════════════════════════════════════
-def parse_korzinka(min_discount=20, limit=10) -> list[dict]:
-    deals = []
-    soup = _get_soup("https://korzinka.uz/ru/promotions",
-                     wait_selector="[class*='product'],[class*='Product'],article")
-    if not soup: log.info("[Korzinka] 0 акций"); return []
-
-    for card in soup.select("[class*='product'],[class*='Product'],article")[:60]:
-        try:
-            t = card.select_one("h2,h3,h4,[class*='name'],[class*='title']")
-            title = t.get_text(strip=True) if t else ""
-            if not title or len(title) < 3: continue
-            old_el = card.select_one("[class*='old'],del,s")
-            new_el = card.select_one("[class*='current'],[class*='new'],[class*='price']")
-            old = _price(old_el.get_text() if old_el else "")
-            new = _price(new_el.get_text() if new_el else "")
-            if not old or not new or old <= new: continue
-            disc = round((old-new)/old*100)
-            if disc < min_discount: continue
-            a = card.select_one("a[href]")
-            href = a["href"] if a else ""
-            link = href if href.startswith("http") else f"https://korzinka.uz{href}"
-            img_el = card.select_one("img")
-            img = (img_el.get("src") or img_el.get("data-src") or "") if img_el else ""
-            deals.append({"id": f"kzk_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
-                          "title": title[:100], "old_price": old, "new_price": new,
-                          "discount": disc, "url": link, "image": img, "shop": "Korzinka.uz 🛒"})
-            if len(deals) >= limit: break
-        except Exception: continue
-
-    log.info(f"[Korzinka] {len(deals)} акций")
-    return deals
-
-# ════════════════════════════════════════════════════════════
-#  TEXNOMART.UZ
+#  TEXNOMART — перехватываем API
 # ════════════════════════════════════════════════════════════
 def parse_texnomart(min_discount=20, limit=10) -> list[dict]:
-    deals = []
-    soup = _get_soup("https://texnomart.uz/ru/sales",
-                     wait_selector="[class*='product'],[class*='item'],article")
-    if not soup: log.info("[Texnomart] 0 акций"); return []
+    captured = []
 
-    for card in soup.select("[class*='product'],[class*='item'],article")[:60]:
+    def on_response(resp):
         try:
-            t = card.select_one("h2,h3,h4,[class*='name'],[class*='title']")
-            title = t.get_text(strip=True) if t else ""
-            if not title or len(title) < 3: continue
-            old_el = card.select_one("[class*='old'],del,s")
-            new_el = card.select_one("[class*='current'],[class*='new'],[class*='price']")
-            old = _price(old_el.get_text() if old_el else "")
-            new = _price(new_el.get_text() if new_el else "")
-            if not old or not new or old <= new: continue
-            disc = round((old-new)/old*100)
-            if disc < min_discount: continue
-            a = card.select_one("a[href]")
-            href = a["href"] if a else ""
-            link = href if href.startswith("http") else f"https://texnomart.uz{href}"
-            img_el = card.select_one("img")
-            img = (img_el.get("src") or img_el.get("data-src") or "") if img_el else ""
-            deals.append({"id": f"txm_{re.sub(r'[^a-z0-9]','',title.lower())[:28]}",
-                          "title": title[:100], "old_price": old, "new_price": new,
-                          "discount": disc, "url": link, "image": img, "shop": "Texnomart.uz 📺"})
-            if len(deals) >= limit: break
-        except Exception: continue
+            if "texnomart.uz" in resp.url and resp.status == 200:
+                ct = resp.headers.get("content-type", "")
+                if "json" in ct:
+                    data = resp.json()
+                    captured.append((resp.url, data))
+        except Exception:
+            pass
+
+    try:
+        with sync_playwright() as pw:
+            br = pw.chromium.launch(headless=True, args=_browser_args())
+            ctx = br.new_context(locale="ru-RU")
+            page = ctx.new_page()
+            page.on("response", on_response)
+            page.goto("https://texnomart.uz/ru/sales", wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(3000)
+            br.close()
+    except Exception as e:
+        log.warning(f"[Texnomart] Browser error: {e}")
+
+    deals = []
+    seen_ids = set()
+    for url, data in captured:
+        log.info(f"[Texnomart] API: {url[:80]}")
+        products = (data.get("data", {}).get("products", [])
+                    or data.get("products", [])
+                    or data.get("items", [])
+                    or [])
+        for p in products:
+            try:
+                pid = str(p.get("id") or p.get("slug") or "")
+                if not pid or pid in seen_ids: continue
+                seen_ids.add(pid)
+                old = (p.get("old_price") or p.get("price_old")
+                       or p.get("base_price") or p.get("original_price") or 0)
+                new = p.get("price") or p.get("sell_price") or p.get("price_new") or 0
+                if not old or not new or old <= new: continue
+                disc = round((old - new) / old * 100)
+                if disc < min_discount: continue
+                imgs = p.get("images") or p.get("photos") or []
+                img = (imgs[0].get("url") or imgs[0].get("src") or "") if imgs else p.get("image", "")
+                slug = p.get("slug") or pid
+                deals.append({
+                    "id": f"txm_{pid}",
+                    "title": (p.get("name") or p.get("title") or "Товар Texnomart")[:100],
+                    "old_price": old, "new_price": new, "discount": disc,
+                    "url": f"https://texnomart.uz/ru/product/{slug}",
+                    "image": img, "shop": "Texnomart.uz 📺",
+                })
+                if len(deals) >= limit: break
+            except Exception: continue
+        if len(deals) >= limit: break
 
     log.info(f"[Texnomart] {len(deals)} акций")
     return deals
@@ -231,13 +228,15 @@ def parse_texnomart(min_discount=20, limit=10) -> list[dict]:
 # ════════════════════════════════════════════════════════════
 #  АГРЕГАТОР
 # ════════════════════════════════════════════════════════════
-ALL_PARSERS = [parse_uzum, parse_olcha, parse_korzinka, parse_texnomart]
+ALL_PARSERS = [parse_uzum, parse_olcha, parse_texnomart]
 
 def fetch_all_sync() -> list[dict]:
     result = []
     for fn in ALL_PARSERS:
-        try: result.extend(fn(min_discount=MIN_DISCOUNT, limit=LIMIT_PER_SHOP))
-        except Exception as e: log.error(f"Парсер {fn.__name__}: {e}")
+        try:
+            result.extend(fn(min_discount=MIN_DISCOUNT, limit=LIMIT_PER_SHOP))
+        except Exception as e:
+            log.error(f"Парсер {fn.__name__}: {e}")
     result.sort(key=lambda d: d["discount"], reverse=True)
     return result
 
@@ -247,11 +246,13 @@ def fetch_all_sync() -> list[dict]:
 def load_seen() -> set:
     return set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
 
-def save_seen(s: set): SEEN_FILE.write_text(json.dumps(list(s)))
+def save_seen(s: set):
+    SEEN_FILE.write_text(json.dumps(list(s)))
 
 pending: dict[str, dict] = {}
 
-def fmt(p: int) -> str: return f"{p:,}".replace(",", " ")
+def fmt(p: int) -> str:
+    return f"{p:,}".replace(",", " ")
 
 def post_text(d: dict) -> str:
     return (f"🔥 *{d['title']}*\n\n"
@@ -270,17 +271,16 @@ def kb(deal_id: str) -> InlineKeyboardMarkup:
     ]])
 
 async def check_and_notify():
-    log.info("Запускаю парсеры через Playwright...")
+    log.info("Запускаю парсеры (перехват API)...")
     seen = load_seen()
-
-    # Запускаем синхронные парсеры в отдельном потоке чтобы не блокировать бота
     deals = await asyncio.to_thread(fetch_all_sync)
+    log.info(f"Итого: {len(deals)} акций")
 
-    log.info(f"Итого найдено: {len(deals)} акций")
     new_count = 0
     for d in deals:
         if d["id"] in seen: continue
-        seen.add(d["id"]); pending[d["id"]] = d
+        seen.add(d["id"])
+        pending[d["id"]] = d
         try:
             if d.get("image"):
                 await bot.send_photo(ADMIN_ID, d["image"], caption=preview_text(d),
@@ -295,17 +295,21 @@ async def check_and_notify():
 
     save_seen(seen)
     if new_count:
-        await bot.send_message(ADMIN_ID, f"✅ Готово. Новых акций: *{new_count}*", parse_mode="Markdown")
+        await bot.send_message(ADMIN_ID,
+            f"✅ Готово. Новых акций: *{new_count}*", parse_mode="Markdown")
     else:
-        await bot.send_message(ADMIN_ID, "🤷 Акций не найдено. Проверьте логи в Railway.")
+        await bot.send_message(ADMIN_ID,
+            "🤷 Акций не найдено.\n\nСмотрите логи в Railway — "
+            "там будут строки `[Uzum] API:` с реальными URL которые перехватили. "
+            "Скиньте их мне.", parse_mode="Markdown")
 
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     if msg.from_user.id != ADMIN_ID: return
     await msg.answer(
         f"👋 *Бот запущен!*\n\n"
-        f"🌐 Браузерный парсинг через Playwright\n"
-        f"🏪 Uzum | Olcha | Korzinka | Texnomart\n"
+        f"🌐 Режим: перехват API через Playwright\n"
+        f"🏪 Uzum | Olcha | Texnomart\n"
         f"⏱ Каждые *{CHECK_HOURS} ч.* | 💥 Мин. скидка *{MIN_DISCOUNT}%*\n\n"
         f"/check — проверить сейчас\n/stats — статистика",
         parse_mode="Markdown")
@@ -313,18 +317,19 @@ async def cmd_start(msg: Message):
 @dp.message(Command("check"))
 async def cmd_check(msg: Message):
     if msg.from_user.id != ADMIN_ID: return
-    await msg.answer("🔍 Открываю сайты через браузер, подождите 1–2 минуты...")
+    await msg.answer("🔍 Открываю сайты, перехватываю API... (~1 мин)")
     await check_and_notify()
 
 @dp.message(Command("stats"))
 async def cmd_stats(msg: Message):
     if msg.from_user.id != ADMIN_ID: return
-    await msg.answer(f"📊 Просмотрено: *{len(load_seen())}* | Ожидают: *{len(pending)}*",
-                     parse_mode="Markdown")
+    await msg.answer(
+        f"📊 Просмотрено: *{len(load_seen())}*\nОжидают одобрения: *{len(pending)}*",
+        parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("pub:"))
 async def on_pub(cb: CallbackQuery):
-    d = pending.pop(cb.data.split(":",1)[1], None)
+    d = pending.pop(cb.data.split(":", 1)[1], None)
     if not d: await cb.answer("Уже обработано.", show_alert=True); return
     try:
         if d.get("image"):
@@ -333,11 +338,12 @@ async def on_pub(cb: CallbackQuery):
             await bot.send_message(CHANNEL_ID, post_text(d), parse_mode="Markdown")
         await cb.message.edit_reply_markup(reply_markup=None)
         await cb.answer("✅ Опубликовано!")
-    except Exception as e: await cb.answer(str(e), show_alert=True)
+    except Exception as e:
+        await cb.answer(str(e), show_alert=True)
 
 @dp.callback_query(F.data.startswith("skip:"))
 async def on_skip(cb: CallbackQuery):
-    pending.pop(cb.data.split(":",1)[1], None)
+    pending.pop(cb.data.split(":", 1)[1], None)
     await cb.message.edit_reply_markup(reply_markup=None)
     await cb.answer("Пропущено.")
 
